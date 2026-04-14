@@ -1,5 +1,63 @@
 # Session Log
 
+## 2026-04-14 — Phase 2 ingestion pipeline
+
+### Completed
+
+- **Schema migration:** `backend/migrations/0001_init.sql` mirrors `docs/DATA_MODEL.md` — `vector`/`pgcrypto` extensions, `documents` and `chunks` tables, `vector(384)` column, ivfflat cosine index (`lists=100`), and `chunks(document_id)` btree. Designed to be pasted into the Supabase SQL editor once per environment.
+- **Embeddings (`ingestion/embeddings.py`):** `@lru_cache` MiniLM singleton; `embed()` returns 384-dim L2-normalized vectors via `normalize_embeddings=True` so cosine distance ≡ dot product in pgvector. `EMBEDDING_DIM = 384` exposed as a constant.
+- **Chunking (`ingestion/chunking.py`):** tokenizer-aware 220/32 windowing using MiniLM's own `AutoTokenizer`. Stays below the 256-token cap (leaves headroom for `[CLS]`/`[SEP]`). Returns a list of `Chunk` TypedDicts with `ordinal`, `content`, `token_count`. Handles empty input and sub-window text correctly.
+- **PDF parse (`ingestion/pdf.py`):** `extract_text(bytes) -> (text, page_count)` via pypdf, joining pages with `\n\n`, raising `ValueError` on zero-page PDFs.
+- **Error envelope (`api/errors.py`):** uniform `{error: {code, message, detail?}}` JSON response helper per `docs/API_CONTRACTS.md`. Adopted by `documents.py`; `query.py` / `ws.py` will pick it up in Phase 3.
+- **Documents API (`api/documents.py`):** end-to-end wiring.
+  - `POST /api/v1/documents`: validate content-type (`application/pdf`, 415 otherwise) and size (≤ 25 MB, 413 otherwise) → extract text → insert `documents` row with `status=processing` → chunk → embed in batches of 32 → bulk `insert` into `chunks` → flip to `status=ready`. On exception, flips to `status=failed` and returns 500 via the error envelope. Returns **202** `{document_id, filename, status: "queued"}` to match the API contract even though Phase 2 processes synchronously.
+  - `GET /api/v1/documents`: single query via Supabase's embedded-resource count (`chunks(count)`), ordered `uploaded_at desc`.
+  - Work done in a thread (`asyncio.to_thread`) so the blocking Supabase client doesn't stall the event loop.
+- **db/client.py:** return type tightened from `object` to `supabase.Client` — clean under `mypy --strict`.
+- **Tests (8 new):**
+  - `test_chunking.py` — empty input → `[]`; short input → single chunk; long input → contiguous ordinals starting at 0, every chunk ≤ 220 tokens.
+  - `test_embeddings.py` — empty batch → `[]`; single vector shape 384 with L2 norm ≈ 1.0; batch of 3 returns 3×384.
+  - `test_documents_api.py` — fake Supabase client + monkeypatched `extract_text` / `chunk_text` / `embed`; happy path asserts 202 + document row with `status=ready` + N chunk rows with 384-dim embeddings; rejection path asserts 415 + `unsupported_media_type` envelope.
+- **Editable-install chore:** formally accepted the `uvicorn --app-dir src ...` convention as the Phase 2 answer to the hatchling / `_virtualenv.pth` ordering bug. Documented in `README.md`. Revisit only if a contributor trips on it.
+- **Dep bump:** `transformers>=4.44` added explicitly to `backend/pyproject.toml` since `ingestion/chunking.py` imports `AutoTokenizer` directly (previously pulled in transitively via `sentence-transformers`).
+
+### Verified locally
+
+- `uv run pytest` → **9 passed** in ~16 s (first run ~40 s on cold model cache).
+- `uv run ruff check .` → clean.
+- `uv run mypy src` → clean under `strict = true`.
+
+### Known rough edges
+
+- Editable-install workaround (`uvicorn --app-dir src ...`) still required — accepted for Phase 2.
+- **Security:** the Supabase `service_role` key was pasted in chat during Phase 1 wiring. Rotate via dashboard → Project Settings → API Keys → service_role → Reset, then update `backend/.env`.
+- MiniLM model + tokenizer download (~90 MB + a few MB) happens on the first test run; CI will re-download on every job until a HuggingFace cache step is added.
+- `GET /documents` uses PostgREST embedded-resource count — relies on the FK from `chunks.document_id → documents.id` that the migration defines. Don't drop the FK without updating the query.
+
+### Not done (deferred)
+
+- Phase 3: Librarian/Analyst/Auditor wired to Groq; retry-on-low-score routing; LangGraph state machine.
+- Phase 4: real WebSocket event emission from agent nodes.
+- Phase 5: sprite art + agent-state-driven animations.
+- Phase 6: Vercel + Render deploy.
+
+### Resume from here — next session
+
+1. **Rotate Supabase service_role key** and update `backend/.env` (security hygiene).
+2. **Apply `backend/migrations/0001_init.sql`** in the Supabase SQL editor (one-time per environment).
+3. **Live-ingest smoke test:** backend running, `curl -F 'file=@some.pdf' http://localhost:8000/api/v1/documents` → 202; confirm a row in `documents` (`status=ready`) and N rows in `chunks` with 384-dim embeddings.
+4. **Begin Phase 3:** wire the agent loop — Groq client, Librarian similarity search via pgvector (`select ... order by embedding <=> $1 limit 5`), Analyst draft, Auditor score, retry on `score < 0.8` with `max_attempts = 3`.
+
+### Environment snapshot
+
+- Node `v24.12.0`, pnpm `10.0.0`
+- Python `3.12` via uv, `uv 0.11.6`
+- Repo: `/Users/bgranillo05/Documents/GitHub/cogniv-vault`
+- Plan files:
+  - `/Users/bgranillo05/.claude/plans/pure-zooming-wall.md` (Phase 2, approved)
+
+---
+
 ## 2026-04-13 — Phase 0 + Phase 1 scaffold
 
 ### Completed

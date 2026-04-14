@@ -209,6 +209,7 @@ dependencies = [
     { name = "python-multipart" },
     { name = "sentence-transformers" },
     { name = "supabase" },
+    { name = "transformers" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "websockets" },
 ]
@@ -249,6 +250,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.7" },
     { name = "sentence-transformers", specifier = ">=3.3" },
     { name = "supabase", specifier = ">=2.9" },
+    { name = "transformers", specifier = ">=4.44" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
     { name = "websockets", specifier = ">=13.1" },
 ]
