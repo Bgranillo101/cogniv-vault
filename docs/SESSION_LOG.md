@@ -1,5 +1,67 @@
 # Session Log
 
+## 2026-04-14 — Phase 3 agent loop
+
+### Completed
+
+- **Migration `0002_match_chunks.sql`:** pgvector cosine RPC. Takes a `vector(384)` query embedding, optional `uuid[]` document filter, and `match_count`; returns `(chunk_id, document_id, ordinal, content, similarity)` ordered by `embedding <=> query_embedding`. Stable, callable via Supabase `client.rpc("match_chunks", …)`.
+- **Groq wrapper (`llm/groq_client.py`):** `@lru_cache` singleton + one `async chat(messages, *, model, temperature, response_format)` helper that delegates to `asyncio.to_thread` around the sync Groq client. Reads `GROQ_MODEL` from settings; defaults to `llama-3.3-70b-versatile`.
+- **Config + env:** `Settings` gains `top_k=5`, `groq_model="llama-3.3-70b-versatile"`. `.env.example` gets both.
+- **Prompts (`agents/prompts.py`):** centralized Analyst and Auditor system prompts + `build_*_messages` helpers that number the retrieved excerpts. Keeps node logic slim.
+- **Nodes wired:**
+  - `librarian.py` — embeds `refined_query or question`, calls the `match_chunks` RPC, shapes results into `Hit` TypedDicts.
+  - `analyst.py` — calls Groq at `temperature=0.2` with the numbered-excerpt prompt, stores `state["draft"]`.
+  - `auditor.py` — calls Groq with `response_format={"type": "json_object"}` and `temperature=0.0`, parses the JSON, clamps `score` to `[0, 1]`, propagates `refined_query` only if non-empty.
+- **Graph (`agents/graph.py`):** real `StateGraph(AgentState)` with nodes `librarian → analyst → auditor → (finalize | bump_attempt)`. Conditional edge exits to `finalize` if `score >= threshold` OR `attempt >= max_attempts`, else `bump_attempt` increments the counter and loops back to `librarian`. `finalize` writes `answer`/`low_confidence`/`citations`. Graph is memoized via `@lru_cache`.
+- **Runner (`agents/runner.py`):** wraps `build_graph().ainvoke()` with initial state seeding (`attempt=1`, `threshold`, `max_attempts`, `started_at`). Shapes terminal output to the `AGENT_RESULT` contract: `{answer, confidence, low_confidence, citations[{chunk_id, document_id, snippet}], trace{attempts, final_score, duration_ms}}`.
+- **Job store (`agents/job_store.py`):** thread-safe TTL-LRU dict (5-min expiry, 100-entry cap). Process-local, in-memory only — documented as lost-on-restart. Placeholder until Phase 4 swaps the poll for a WebSocket stream.
+- **Query API (`api/query.py`):** `POST /query` validates non-empty question, runs the graph synchronously, stores the result under a fresh UUID, returns `202 {job_id}`. `GET /query/{job_id}` pops the stored result (one-shot) or returns 404 via the error envelope. Agent-side exceptions caught and returned as `500 agent_failed`.
+- **Frontend:** new `QueryPanel.tsx` — input + submit, fires `submitQuery → getQueryResult`, renders answer, confidence, attempts, duration, and collapsible citations. Mounted above the existing Phaser canvas in `App.tsx`. `api/client.ts` gained `getQueryResult` + exported `QueryResult`/`Citation` types.
+- **Tests (5 new, 14 total):**
+  - `conftest.py` — `fake_groq` fixture queues scripted responses and monkeypatches `chat` at all three import sites (analyst, auditor, module). `fake_supabase_rpc` monkeypatches `get_supabase_client` + `embed` in the librarian module and returns canned hits.
+  - `test_agents_graph.py` — single-pass success (score 0.92 → attempt=1, low_confidence=False, citations populated), retry-then-success (0.5 → 0.85, attempt=2, refined_query carried), hard fail (0.3 × 3 → attempt=3, low_confidence=True, draft still surfaced).
+  - `test_query_api.py` — POST → GET round-trip returns the AGENT_RESULT payload; second GET is 404 (one-shot eviction); empty question is 400 `invalid_request`.
+- **Docs:** ADR 0005 (Groq model + JSON-mode for auditor). README status + "What works today" matrix + quickstart updated with `GET /query/{job_id}` example and the 0002 migration step.
+
+### Verified locally
+
+- `uv run --active pytest` → **14 passed** in ~9 s.
+- `uv run --active ruff check .` → clean.
+- `uv run --active mypy src` → clean under `strict = true`.
+- `pnpm --filter frontend typecheck` + `lint` → clean.
+
+### Known rough edges
+
+- **Editable-install workaround still required** — `uv run --active` (or `uvicorn --app-dir src …`) is how the package is importable. Unchanged from Phase 2.
+- **Job store is in-memory only.** Backend restart drops all pending results; fine for Phase 3 since there is no production deploy. Phase 4's WS removes the need for this store.
+- **No general-knowledge fallback yet.** Ungrounded questions (nothing relevant in the library) will surface as low-confidence answers — by design. A `router` node for ungrounded fallback is scoped as a Phase 7+ add-on.
+- **Only PDFs still.** Other upload formats (markdown, HTML, images/OCR) remain Phase 7+ work; the pipeline downstream of `extract_text()` is already format-agnostic.
+- **Groq model is pinned via env.** Changing `GROQ_MODEL` works, but Auditor scoring calibration should be re-validated before promoting a new model.
+
+### Not done (deferred)
+
+- Phase 4: WebSocket emission of per-node events (`AGENT_START`, `AGENT_SEARCH`, `AGENT_SYNTHESIZE`, `AGENT_VERIFY`, `AGENT_RETRY`, `AGENT_RESULT`).
+- Phase 5: Phaser sprites + agent-state-driven animations keyed off WS events.
+- Phase 6: Vercel + Render deploy.
+- Phase 7+: ungrounded-query fallback path, additional upload formats.
+
+### Resume from here — next session
+
+1. **Apply `backend/migrations/0002_match_chunks.sql`** in the Supabase SQL editor (one-time per environment). Verify: `select match_chunks(array_fill(0::real, array[384])::vector(384), 1);` runs without error.
+2. **Rotate Supabase `service_role` key** (still pending from Phase 2 — was pasted in chat during Phase 1 wiring).
+3. **Live end-to-end smoke test:** ingest a PDF → `curl -X POST http://localhost:8000/api/v1/query -H 'content-type: application/json' -d '{"question":"…"}'` → 202 → `curl /api/v1/query/<job_id>` → real answer + citations from your content.
+4. **Begin Phase 4:** emit per-node events over `/ws/query/{job_id}`. Shape matches `docs/API_CONTRACTS.md`. Source events from within each agent node (callback / queue-per-job pattern), drop the poll, keep `GET /query/{job_id}` as a replay endpoint.
+
+### Environment snapshot
+
+- Node `v24.12.0`, pnpm `10.0.0`
+- Python `3.12` via uv, `uv 0.11.6`
+- Repo: `/Users/bgranillo05/Documents/GitHub/cogniv-vault`
+- Plan files:
+  - `/Users/bgranillo05/.claude/plans/phase-3-agent-loop.md` (approved, executed)
+
+---
+
 ## 2026-04-14 — Phase 2 ingestion pipeline
 
 ### Completed

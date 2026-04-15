@@ -14,8 +14,10 @@ class Settings(BaseSettings):
 
     verify_threshold: float = 0.8
     max_attempts: int = 3
+    top_k: int = 5
 
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    groq_model: str = "llama-3.3-70b-versatile"
 
     @property
     def cors_origin_list(self) -> list[str]:

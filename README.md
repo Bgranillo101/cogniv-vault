@@ -8,9 +8,9 @@ Most RAG systems are black boxes: you submit a question, wait, and receive an an
 
 ## Status
 
-**Phase 2 complete — ingestion pipeline is live.** You can `POST` a PDF to the backend and it is parsed (pypdf), chunked (MiniLM-tokenizer-aware, 220 tokens / 32 overlap), embedded locally (`all-MiniLM-L6-v2`, 384 dims, L2-normalized), and persisted to Supabase with a pgvector cosine index ready for retrieval. `GET /api/v1/documents` returns every ingested document with its chunk count.
+**Phase 3 complete — the agent loop is live.** You can now ask your library questions end-to-end: `POST /api/v1/query` runs Librarian → Analyst → Auditor over your ingested PDFs, retries on low-confidence scores, and returns a grounded answer with citations. The frontend ships a minimal "Ask" panel wired to the round-trip. Real-time WebSocket streaming of each agent's events lands in Phase 4.
 
-The frontend still shows the Phase 1 Phaser canvas (controllable librarian sprite). The agent loop and real-time event stream come in Phase 3+.
+Phase 2 (ingestion) remains live: PDFs are parsed (pypdf), chunked (MiniLM-tokenizer-aware, 220/32), embedded locally (`all-MiniLM-L6-v2`, 384 dims, L2-normalized), and persisted to Supabase with a pgvector cosine index.
 
 See [docs/SESSION_LOG.md](docs/SESSION_LOG.md) for the full progress journal.
 
@@ -25,7 +25,9 @@ See [docs/SESSION_LOG.md](docs/SESSION_LOG.md) for the full progress journal.
 | `GET /api/v1/documents` — list with `chunk_count` | ✅ |
 | Supabase `documents` + `chunks` schema with `vector(384)` + ivfflat cosine index | ✅ |
 | Phaser canvas with arrow-key-controllable librarian | ✅ |
-| `POST /api/v1/query` — agentic answer via Librarian/Analyst/Auditor | ⏳ Phase 3 |
+| `POST /api/v1/query` + `GET /api/v1/query/{job_id}` — agentic answer via Librarian/Analyst/Auditor (Groq Llama-3.3-70B) | ✅ |
+| Auditor retry on score < 0.8 (max 3 attempts) with Groq-generated refined query | ✅ |
+| Frontend "Ask" panel — submit → poll → answer + citations | ✅ |
 | `/ws/query/{job_id}` — live agent event stream | ⏳ Phase 4 |
 | Sprite art + agent animations tied to events | ⏳ Phase 5 |
 
@@ -72,15 +74,17 @@ Full component + state diagrams: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 cogniv-vault/
 ├── backend/                 FastAPI + LangGraph service (Python / uv)
 │   ├── migrations/
-│   │   └── 0001_init.sql    Supabase schema (apply via SQL editor)
+│   │   ├── 0001_init.sql    Supabase schema (apply via SQL editor)
+│   │   └── 0002_match_chunks.sql  pgvector cosine-similarity RPC
 │   ├── src/cogniv_vault/
 │   │   ├── main.py          app factory, CORS, router mounts
 │   │   ├── config.py        pydantic-settings
 │   │   ├── api/             health, documents, query, ws, errors
-│   │   ├── agents/          librarian, analyst, auditor, graph (Phase 3 stubs)
+│   │   ├── agents/          librarian, analyst, auditor, graph, runner, job_store, prompts
+│   │   ├── llm/             Groq async wrapper
 │   │   ├── ingestion/       pdf, chunking, embeddings
 │   │   └── db/              supabase client
-│   └── tests/               9 passing (chunking, embeddings, documents API, health)
+│   └── tests/               14 passing (chunking, embeddings, documents API, health, agents graph, query API)
 ├── frontend/                React + Phaser client (pnpm workspace)
 │   └── src/
 │       ├── api/client.ts       REST wrapper
@@ -125,10 +129,11 @@ cp frontend/.env.example frontend/.env
 
 ### 3. Apply the database schema (one-time per Supabase project)
 
-Open your Supabase dashboard → SQL editor → paste the contents of [`backend/migrations/0001_init.sql`](backend/migrations/0001_init.sql) → run. Verify with:
+Open your Supabase dashboard → SQL editor → paste the contents of [`backend/migrations/0001_init.sql`](backend/migrations/0001_init.sql) → run. Then apply [`backend/migrations/0002_match_chunks.sql`](backend/migrations/0002_match_chunks.sql) the same way (defines the `match_chunks` RPC used by the Librarian). Verify with:
 
 ```sql
-select to_regclass('public.chunks');   -- should return 'chunks'
+select to_regclass('public.chunks');          -- should return 'chunks'
+select match_chunks(array_fill(0::real, array[384])::vector(384), 1);  -- should run (0 rows if chunks is empty)
 ```
 
 ### 4. Run
@@ -163,6 +168,23 @@ curl http://localhost:8000/api/v1/documents
 ```
 
 First request will download the MiniLM model (~90 MB) into the HuggingFace cache. Subsequent requests are fast.
+
+### 6. Ask a question
+
+With `GROQ_API_KEY` set and at least one PDF ingested:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/query \
+  -H 'content-type: application/json' \
+  -d '{"question":"what is this document about?"}'
+# → 202 {"job_id": "..."}
+
+curl http://localhost:8000/api/v1/query/<job_id>
+# → {"answer": "...", "confidence": 0.92, "low_confidence": false,
+#     "citations": [...], "trace": {"attempts": 1, "final_score": 0.92, "duration_ms": 3140}}
+```
+
+Or use the "Ask" panel on the UI — it does the round-trip for you.
 
 ---
 
@@ -199,7 +221,7 @@ Conventional Commits (`feat:`, `fix:`, `docs:`, …). See [CONTRIBUTING.md](CONT
 | 0     | Blueprint, ADRs, architecture docs                                                     | ✅     |
 | 1     | Monorepo scaffold, FastAPI stub, Phaser canvas with controllable character             | ✅     |
 | 2     | Supabase schema, PDF chunking, MiniLM embeddings, `POST /documents` end-to-end         | ✅     |
-| 3     | LangGraph Librarian/Analyst/Auditor wired to Groq; retry-on-low-score enforced         | ⏳     |
+| 3     | LangGraph Librarian/Analyst/Auditor wired to Groq; retry-on-low-score enforced         | ✅     |
 | 4     | Real-time WebSocket event stream from agent nodes to UI                                | ⏳     |
 | 5     | Sprite art, isometric library world, agent animations tied to phase events            | ⏳     |
 | 6     | Vercel (frontend) + Render (backend) deploy, Supabase managed DB                       | ⏳     |
